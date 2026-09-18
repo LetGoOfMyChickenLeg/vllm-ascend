@@ -103,9 +103,6 @@ def get_cos_and_sin_dsa(
             if group_name not in registered_groups:
                 continue
 
-            curr_cos = full_rope_cos[pos_tensor]
-            curr_sin = full_rope_sin[pos_tensor]
-
             if use_cache:
                 group_buffers = (
                     _ROPE_STATE.runtime_buffer.get(config_key, {}).get(group_name)
@@ -119,19 +116,35 @@ def get_cos_and_sin_dsa(
                 buf_cos, buf_sin = group_buffers
                 num_tokens = pos_tensor.size(0)
 
+                # This is semantically equivalent to the previous
+                # `full_rope_cos[pos_tensor] / full_rope_sin[pos_tensor]`
+                # indexing followed by `copy_`; the change only combines the
+                # indexing and the write into the preallocated output buffers.
+                #
+                # gather_idx is built so torch.gather picks the same rows: each
+                # row contains the token index repeated along the rotary dim.
+                # pos_tensor -> reshape(-1, 1, 1, 1) gives each token its own
+                # row; expand() broadcasts that row across the rotary dim to
+                # match full_rope_* (which is [max_pos, 1, 1, rotary_dim]),
+                # so torch.gather(..., dim=0) selects row pos_tensor[i].
+                gather_idx = (
+                    pos_tensor.to(torch.long).reshape(-1, 1, 1, 1).expand(num_tokens, 1, 1, full_rope_cos.size(-1))
+                )
                 if draft_index is None:
-                    buf_cos[:num_tokens].copy_(curr_cos)
-                    buf_sin[:num_tokens].copy_(curr_sin)
+                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[:num_tokens])
+                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[:num_tokens])
 
                     batch_result[config_key][group_name] = (buf_cos[:num_tokens], buf_sin[:num_tokens])
                 else:
-                    buf_cos[draft_index - 1][:num_tokens].copy_(curr_cos)
-                    buf_sin[draft_index - 1][:num_tokens].copy_(curr_sin)
+                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[draft_index - 1][:num_tokens])
+                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[draft_index - 1][:num_tokens])
                     batch_result[config_key][group_name] = (
                         buf_cos[draft_index - 1][:num_tokens],
                         buf_sin[draft_index - 1][:num_tokens],
                     )
             else:
+                curr_cos = full_rope_cos[pos_tensor]
+                curr_sin = full_rope_sin[pos_tensor]
                 batch_result[config_key][group_name] = (curr_cos, curr_sin)
 
     return RopeDataProxy(batch_result, is_cos=True), RopeDataProxy(batch_result, is_cos=False)
@@ -161,6 +174,23 @@ def get_full_cos_and_sin_dsa(group_name: str) -> tuple[torch.Tensor, torch.Tenso
     return _ROPE_STATE.full_rope_cache[config_key]
 
 
+def get_full_cos_and_sin_dsa_for_layer(
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the full RoPE cache selected by one registered layer.
+
+    A group name is not sufficient for V4.1 because pure-SWA and long-context
+    layers both use the ``default`` group while registering different RoPE
+    configurations.  Resolving through ``layer_info`` keeps the compressor
+    metadata path tied to the exact table used by its source attention layer.
+    """
+    info = _ROPE_STATE.layer_info.get(layer_name)
+    if info is None:
+        raise KeyError(f"RoPE layer {layer_name!r} is not registered")
+    config_key, _ = info
+    return _ROPE_STATE.full_rope_cache[config_key]
+
+
 class ComplexExpRotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -181,9 +211,12 @@ class ComplexExpRotaryEmbedding(nn.Module):
         self.rotary_dim = rotary_dim
         beta_fast = extra_kwargs.get("beta_fast", 32)
         beta_slow = extra_kwargs.get("beta_slow", 1)
+        original_seq_len = extra_kwargs.get("original_max_position_embeddings", max_position_embeddings)
+        apply_yarn_scaling = extra_kwargs.get("apply_yarn_scaling", True)
         config_key = (
             f"rotary_dim{rotary_dim}_max_position_embeddings{max_position_embeddings}_"
-            f"base{base}_scaling_factor{scaling_factor}_beta_fast{beta_fast}_beta_slow{beta_slow}"
+            f"original_seq_len{original_seq_len}_apply_yarn{apply_yarn_scaling}_base{base}_scaling_factor{scaling_factor}_"
+            f"beta_fast{beta_fast}_beta_slow{beta_slow}"
         )
         _ROPE_STATE.layer_info[layername] = (config_key, rope_groups)
 
@@ -194,7 +227,14 @@ class ComplexExpRotaryEmbedding(nn.Module):
 
         if config_key not in _ROPE_STATE.full_rope_cache:
             inv_freq = self.precompute_freqs_cis(
-                rotary_dim, max_position_embeddings, max_position_embeddings, base, scaling_factor, beta_fast, beta_slow
+                rotary_dim,
+                max_position_embeddings,
+                original_seq_len,
+                base,
+                scaling_factor,
+                beta_fast,
+                beta_slow,
+                apply_yarn_scaling=apply_yarn_scaling,
             )
             t = torch.arange(
                 max_position_embeddings * scaling_factor,
@@ -240,7 +280,9 @@ class ComplexExpRotaryEmbedding(nn.Module):
                     _ROPE_STATE.spec_runtime_buffer[config_key][grp] = (buf_cos, buf_sin)
 
     @staticmethod
-    def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow):
+    def precompute_freqs_cis(
+        dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow, *, apply_yarn_scaling=True
+    ):
         def yarn_find_correction_dim(
             num_rotations: int,
             dim: int,
@@ -275,6 +317,8 @@ class ComplexExpRotaryEmbedding(nn.Module):
 
         pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
+        if not apply_yarn_scaling:
+            return inv_freq_extrapolation
         inv_freq_interpolation = 1.0 / (factor * pos_freqs)
 
         low, high = yarn_find_correction_range(
