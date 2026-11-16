@@ -152,8 +152,18 @@ Unlike `/rerun`, which only retries jobs that already failed inside an existing 
 `/run` starts a fresh run against the current head commit. The test scope follows the
 labels the PR currently carries (`ready-precise`, `ready-all`, `ready-a5`,
 `main2main`); without any of them only `pre-commit` and `cpu-ut` run, which is the
-same scope a push used to get. If a run for the same commit is already queued or in
-progress, `/run` is a no-op.
+same scope a push used to get.
+
+`/run` always replies on the comment, so a silent no-op is not possible:
+
+| Situation | What happens |
+|---|---|
+| A run for this commit is queued or in progress | No new run is started |
+| A run for this commit is waiting for maintainer approval | No new run is started; approval is what unblocks it |
+| This commit already passed the gate | A new run is started, with a note about the extra cost |
+| The PR cannot be tested (merged, closed, or an unsupported base branch) | No run is started; the reason is stated |
+| You are not the PR author and lack triage permission | No run is started |
+| The runs API could not be queried | No run is started, so nothing is guessed |
 
 **Examples:**
 

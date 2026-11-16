@@ -110,6 +110,11 @@ Re-trigger after fixing an issue: pushing a new commit does not start CI by itse
 Post `/e2e` again to re-run these paths, or `/run` to run the full PR gate on the
 latest commit.
 
+`ci-gate` is a required check on `main`, and required checks are evaluated against
+the head commit. A commit that was never triggered therefore stays at
+`Expected — Waiting for status to be reported`, and the PR cannot be merged until
+`/run` (or a label change) produces a result for that commit.
+
 ## Troubleshooting
 
 **The workflow did not start after I posted the comment.**
